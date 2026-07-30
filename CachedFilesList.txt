@@ -1,0 +1,6 @@
+index.html
+projects.html
+contact.html
+About.html
+styles.css
+clock.js
