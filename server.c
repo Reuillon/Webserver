@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
-
+#include <pthread.h>
 
 typedef struct 
 {
@@ -15,6 +15,24 @@ typedef struct
 	char fileName[256];
 	size_t fileSize;
 }CachedFile;
+
+typedef struct
+{
+	char* metadata;
+	int isTextFile;
+}MetaData;
+
+struct timeval timeout = {
+    .tv_sec = 5,
+    .tv_usec = 0
+};
+
+typedef struct
+{
+    int clientfd;
+    SSL_CTX *ctx;
+    struct sockaddr_in clientAddr;
+} ClientConnection;
 
 CachedFile* LoadCacheList();
 
@@ -25,9 +43,9 @@ void LoadGetRequest(char* filename, SSL* ssl, char* metadata);
 
 CachedFile InitCachedFile(char* fileName, int isTextFile);
 
-int CheckFileExtenstion(char* FileName);
+MetaData CheckFileExtenstion(char* FileName);
 
-char* metadata;
+void *HandleClient(void *arg);
 
 CachedFile* cachedFiles;
 
@@ -53,8 +71,7 @@ int main()
 	
 	//CLIENT DATA
 	struct sockaddr_in clientAddr;
-	socklen_t clientLen = sizeof(clientAddr);
-	
+
 	//BINDS PORT AND IP ADDRESS TO SOCKET
 	if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
 	{
@@ -97,20 +114,12 @@ int main()
         fprintf(stderr, "Private key does not match certificate\n");
         return 1;
     }
-	
-	//TIMEOUT STRUCT
-	struct timeval timeout;
-	timeout.tv_sec = 5;
-	timeout.tv_usec = 0;
-
-	metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
 
 	//MAIN LOOP FOR SENDING AND RECEIVING
 	while (1)
 	{
-
+		socklen_t clientLen = sizeof(clientAddr);
 		//CHECKS HEADER FOR CONTENT TYPE IN THIS CASE FOR IMAGES
-		int isTextFile = 1;
 		printf("awaiting connection....\n");
 		
 		int clientfd = accept(sockfd, (struct sockaddr*)&clientAddr, &clientLen);
@@ -121,82 +130,29 @@ int main()
 		{
 		   continue;
 		}
-		
 		//CREATES AND CHECKS SSL OBJECT
-		SSL* ssl = SSL_new(ctx);
-		if(ssl == NULL)
+		ClientConnection *conn = malloc(sizeof(ClientConnection));
+		if (conn == NULL)
 		{
-			close(clientfd);
+			perror("malloc");
 			continue;
 		}
+		conn->clientfd = clientfd;
+		conn->ctx = ctx;
+		conn->clientAddr = clientAddr;
 		
-		//SET SEND AND RECEIVE TIMEOUTS
-		setsockopt(clientfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-		setsockopt(clientfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+		pthread_t thread;
+		if (pthread_create(&thread, NULL, HandleClient, conn) != 0)
+		{
+			perror("pthread_create");
 		
-		//CHECK IF FILE DESCRIPTOR IS VALID
-        if(SSL_set_fd(ssl, clientfd) <= 0)
-		{
-			SSL_free(ssl);
 			close(clientfd);
+			free(conn);
 			continue;
 		}
-
-		//CHECK WETHER HANDSHAKE IS VALID
-		if (SSL_accept(ssl) <= 0)
-		{
-			ERR_print_errors_fp(stderr);
-			SSL_free(ssl);
-			close(clientfd);
-			continue;
-		}
-		else
-		{
-			char buffer[65536] = {0};
-			int sslRead = SSL_read(ssl, buffer, sizeof(buffer) - 1);
-			if (sslRead <= 0)
-			{
-				SSL_free(ssl);
-				close(clientfd);
-				continue;
-			}
-			buffer[sslRead] = '\0';
-			
-			
-			
-			char method[16];
-			char filename[256];
-			char version[16];
-			
-			//CHECK IF REQUEST IS A VALID GET REQUEST
-			if (sscanf(buffer, "%15s /%255s %15s", method, filename, version) == 3 && strcmp(method, "GET") == 0)
-			{
-				isTextFile = CheckFileExtenstion(filename);
-				
-				
-
-				//IF FILE TYPE IS A VALID FILETYPE
-				if (isTextFile != -1)
-				{
-					LoadGetRequest(filename, ssl, metadata);	
-				}
-				//IF UNKNOWN/UNAUTHORIZED FILE EXTENSION OR FILE NAME DEFAULT TO HOMEPAGE
-				else
-				{
-					LoadGetRequest("index.html", ssl, metadata);	
-				}
-			}
-			//IF REQUEST IS MALFORMED OR NOT A GET REQUEST
-			else
-			{
-				char* response = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-				SSL_write(ssl, response, strlen(response));
-			}
-			
-		}		
-		SSL_shutdown(ssl);
-		SSL_free(ssl);	
-		close(clientfd);
+		pthread_detach(thread);
+		
+		
 	}
 
     SSL_CTX_free(ctx);
@@ -239,11 +195,109 @@ CachedFile* LoadCacheList()
 	while (fgets(line, sizeof(line), List_Cached_Files))
 	{
 		line[strcspn(line, "\r\n")] = '\0';
-		cachedFiles[currentFileIndex] = InitCachedFile(line, CheckFileExtenstion(line));
+		cachedFiles[currentFileIndex] = InitCachedFile(line, CheckFileExtenstion(line).isTextFile);
 		++currentFileIndex;
 	}
 	fclose(List_Cached_Files);
 	return cachedFiles;
+}
+
+void *HandleClient(void *arg)
+{
+    ClientConnection *conn = (ClientConnection *)arg;
+
+    int clientfd = conn->clientfd;
+    SSL_CTX *ctx = conn->ctx;
+
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+
+
+    SSL *ssl = SSL_new(ctx);
+
+    if (ssl == NULL)
+    {
+        close(clientfd);
+        free(conn);
+        return NULL;
+    }
+
+
+    // SET SEND AND RECEIVE TIMEOUTS
+    setsockopt(clientfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    setsockopt(clientfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+
+    // ATTACH SOCKET TO SSL
+    if (SSL_set_fd(ssl, clientfd) <= 0)
+    {
+        SSL_free(ssl);
+        close(clientfd);
+        free(conn);
+        return NULL;
+    }
+
+
+    // TLS HANDSHAKE
+    if (SSL_accept(ssl) <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+
+        SSL_free(ssl);
+        close(clientfd);
+        free(conn);
+        return NULL;
+    }
+
+
+    char buffer[65536] = {0};
+
+    int sslRead = SSL_read(ssl, buffer, sizeof(buffer) - 1);
+
+    if (sslRead <= 0)
+    {
+        SSL_free(ssl);
+        close(clientfd);
+        free(conn);
+        return NULL;
+    }
+
+    buffer[sslRead] = '\0';
+
+
+    char method[16];
+    char filename[256];
+    char version[16];
+
+
+    if (sscanf(buffer, "%15s /%255s %15s", method, filename, version) == 3 && strcmp(method, "GET") == 0)
+    {
+
+        MetaData getMetaData = CheckFileExtenstion(filename);
+
+        if (getMetaData.isTextFile != -1)
+        {
+            LoadGetRequest(filename, ssl, getMetaData.metadata);
+        }
+        else
+        {
+            LoadGetRequest("index.html", ssl, getMetaData.metadata);
+        }
+    }
+    else
+    {
+        char *response = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+        SSL_write(ssl, response, strlen(response));
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(clientfd);
+
+    free(conn);
+
+    return NULL;
 }
 
 //LOADS A FILE DIRECTLY INTO MEMORY TO PREVENT MULTIPLE FILE READS
@@ -259,10 +313,10 @@ CachedFile InitCachedFile(char* fileName, int isTextFile)
 			fseek(loadedFile, 0, SEEK_END);
 			size_t fileSize = ftell(loadedFile);
 			rewind(loadedFile);
-			newFile.data = malloc(fileSize);
+			newFile.data = malloc(fileSize + 1);
 			newFile.fileSize = fileSize;
 			strcpy(newFile.fileName, fileName);
-			fread(newFile.data, 1, fileSize + 1, loadedFile);
+			fread(newFile.data, 1, fileSize, loadedFile);
 			newFile.data[fileSize] = '\0';
 			fclose(loadedFile);
 		}
@@ -313,10 +367,30 @@ void LoadGetRequest(char* filename, SSL* ssl, char* metadata)
 		if (strncmp(cachedFiles[i].fileName, filename, strlen(filename)) == 0)
 		{
 			printf("WritingFromCache!\n");
-			CacheExists = 1;
-			SSL_write(ssl, cachedFiles[i].data, cachedFiles[i].fileSize);
+			if (cachedFiles[i].fileSize <= 16384)
+			{
+				CacheExists = 1;
+				SSL_write(ssl, cachedFiles[i].data, cachedFiles[i].fileSize);
+			}
+			else
+			{
+				size_t sent = 0;
+				while(sent < cachedFiles[i].fileSize)
+				{
+					size_t remaining = cachedFiles[i].fileSize - sent;
+					size_t chunk = ((remaining < 16384 ) ? remaining : 16384);
+					int written = SSL_write(ssl, cachedFiles[i].data + sent, chunk);
+					if(written <= 0)
+					{
+						return;
+					}
+					sent += written;
+				}
+			}
 			return;
+			
 		}
+		
 	}
 	//IF NO CACHE FILE EXIST THEN SERVER ATTEMPTS TO LOAD FROM DISK
 	if (CacheExists != 1)
@@ -362,44 +436,54 @@ void LoadGetRequest(char* filename, SSL* ssl, char* metadata)
 }
 
 //CHECKS EXTENSION OF FILENAME AND SETS METADATA TO CORRECT VALUES
-int CheckFileExtenstion(char* fileName)
+MetaData CheckFileExtenstion(char* fileName)
 {
+	MetaData finalMetaData;
 	if (strstr(fileName, ".html"))
 	{
-		metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
-		return 1;
+		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+		finalMetaData.isTextFile = 1;
+		return finalMetaData;
 	}
 	else if (strstr(fileName, ".css"))
 	{
-		metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\n\r\n";
-		return 1;
+		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\n\r\n";
+		finalMetaData.isTextFile = 1;
+		return finalMetaData;
 	}
 	else if (strstr(fileName, ".js"))
 	{
-		metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\n\r\n";
-		return 1;
+		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\n\r\n";
+		finalMetaData.isTextFile = 1;
+		return finalMetaData;
 	}
 	else if (strstr(fileName, ".jpg") || strstr(fileName, ".jpeg"))
 	{
-		metadata = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\r\n";
-		return 0;
+		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\r\n";
+		finalMetaData.isTextFile = 0;
+		return finalMetaData;
 	}
 	else if (strstr(fileName, ".png"))
 	{
-		metadata = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n";
-		return 0;
+		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n";
+		finalMetaData.isTextFile = 0;
+		return finalMetaData;
 	}
 	else if (strchr(fileName, '%') != NULL || strchr(fileName, '/') != NULL || strchr(fileName, '\\')  != NULL || strstr(fileName, "..")  != NULL || strlen(fileName) > 100)
 	{
 		printf("BAD URL\n\n");
-		metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
-		return -1;
+		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+		finalMetaData.isTextFile = -1;
+		return finalMetaData;
 	}
 	else
 	{
-		metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
-		return -1;
+		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+		finalMetaData.isTextFile = -1;
+		return finalMetaData;
 	}
 
-	return 1;
+	finalMetaData.metadata = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n";
+		
+	return finalMetaData;
 }
