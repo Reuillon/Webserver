@@ -18,12 +18,13 @@ typedef struct
 
 typedef struct
 {
-	char* metadata;
+	const char* contentType;
+	const char* status;
 	int isTextFile;
-}MetaData;
+}HTTPResponse;
 
 struct timeval timeout = {
-    .tv_sec = 5,
+    .tv_sec = 20,
     .tv_usec = 0
 };
 
@@ -39,11 +40,11 @@ CachedFile* LoadCacheList();
 int cachedFileSize = 0;
 
 //LOADS THE DATA FROM GET REQUEST ON THE WEBSERVER
-void LoadGetRequest(char* filename, SSL* ssl, char* metadata);
+void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response);
 
 CachedFile InitCachedFile(char* fileName, int isTextFile);
 
-MetaData CheckFileExtenstion(char* FileName);
+HTTPResponse CheckFileExtenstion(char* FileName);
 
 void *HandleClient(void *arg);
 
@@ -210,7 +211,7 @@ void *HandleClient(void *arg)
     SSL_CTX *ctx = conn->ctx;
 
     struct timeval timeout;
-    timeout.tv_sec = 5;
+    timeout.tv_sec = 20;
     timeout.tv_usec = 0;
 
 
@@ -252,45 +253,57 @@ void *HandleClient(void *arg)
     }
 
 
-    char buffer[65536] = {0};
+char buffer[65536];
 
-    int sslRead = SSL_read(ssl, buffer, sizeof(buffer) - 1);
+	while(1)
+	{
+		memset(buffer, 0, sizeof(buffer));
+	
+		int sslRead = SSL_read(ssl, buffer, sizeof(buffer) - 1);
+	
+		if (sslRead <= 0)
+		{
+			break;
+		}
+	
+		buffer[sslRead] = '\0';
+		int keepAlive = 1;
 
-    if (sslRead <= 0)
-    {
-        SSL_free(ssl);
-        close(clientfd);
-        free(conn);
-        return NULL;
-    }
-
-    buffer[sslRead] = '\0';
-
-
-    char method[16];
-    char filename[256];
-    char version[16];
-
-
-    if (sscanf(buffer, "%15s /%255s %15s", method, filename, version) == 3 && strcmp(method, "GET") == 0)
-    {
-
-        MetaData getMetaData = CheckFileExtenstion(filename);
-
-        if (getMetaData.isTextFile != -1)
-        {
-            LoadGetRequest(filename, ssl, getMetaData.metadata);
-        }
-        else
-        {
-            LoadGetRequest("index.html", ssl, getMetaData.metadata);
-        }
-    }
-    else
-    {
-        char *response = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-        SSL_write(ssl, response, strlen(response));
-    }
+		if(strstr(buffer, "Connection: close"))
+		{
+			keepAlive = 0;
+		}
+	
+		char method[16];
+		char filename[256];
+		char version[16];
+	
+	
+		if(sscanf(buffer, "%15s %255s %15s", method, filename, version) == 3
+		&& strcmp(method, "GET") == 0)
+		{
+			if(filename[0] == '/')
+			{
+				memmove(filename, filename + 1, strlen(filename));
+			}
+	
+			HTTPResponse response = CheckFileExtenstion(filename);
+	
+			LoadGetRequest(filename, ssl, response);
+			if(!keepAlive)
+			{
+				break;
+			}
+		}
+		else
+		{
+			char* response = "HTTP/1.1 405 Method Not Allowed\r\n Connection: close\r\n\r\n";
+	
+			SSL_write(ssl, response, strlen(response));
+	
+			break;
+		}
+	}
     SSL_shutdown(ssl);
     SSL_free(ssl);
     close(clientfd);
@@ -352,20 +365,24 @@ CachedFile InitCachedFile(char* fileName, int isTextFile)
 }
 
 //LOADS THE DATA FROM GET REQUEST ON THE WEBSERVER
-void LoadGetRequest(char* filename, SSL* ssl, char* metadata)
+void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 {
-	//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
-	if (SSL_write(ssl, metadata, strlen(metadata)) <= 0)
-	{
-		return;
-	}
-
+	
+	char finalResponseString[256];
+	
 	int CacheExists = 0;	
 	//CHECKS IF FILE REQUEST EXISTS ON DISK
 	for(int i = 0; i < cachedFileSize; i++)
 	{
 		if (strncmp(cachedFiles[i].fileName, filename, strlen(filename)) == 0)
 		{
+			snprintf(finalResponseString, sizeof(finalResponseString),
+			"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
+			//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
+			if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
+			{
+				return;
+			}
 			printf("WritingFromCache!\n");
 			if (cachedFiles[i].fileSize <= 16384)
 			{
@@ -401,7 +418,21 @@ void LoadGetRequest(char* filename, SSL* ssl, char* metadata)
 		size_t bytesRead; 
 			
 		if (f)
-		{			
+		{	
+			if (fseek(f, 0, SEEK_END) != 0) 
+			{
+				fclose(f);
+				return;
+			}
+			 
+			snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, ftell(f));
+			rewind(f);
+			
+			//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
+			if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
+			{
+				return;
+			}	
 			while ((bytesRead = fread(buffer, 1, sizeof(buffer), f)) > 0)
 			{
 				if (SSL_write(ssl, buffer, bytesRead) <= 0)
@@ -412,10 +443,44 @@ void LoadGetRequest(char* filename, SSL* ssl, char* metadata)
 			fclose(f);
 		}
 		else
-		{
-			f = fopen("index.html", "rb");
+		{				
+			//FIX LATER: THIS LINE IS SUPPOSED TO REDIRECT TO THE HOME PAGE IF NO TEXT IS ENTERED IN THE URL
+			//PROBLEM IS THE GET REQUEST IS TRUNCATED WITHOUT A FILENAME AND THUS HTTP/1.1 IS GATHERED
+			if (strncmp(filename, "HTTP/1.1", strlen(filename)) == 0)
+			{
+				f = fopen("index.html", "rb");
+			}
+			else
+			{
+				if (response.isTextFile == -2)
+				{
+					response.status = "403 Forbidden";
+					f = fopen("403.html", "rb");
+				}
+				else
+				{
+					response.status = "404 Not Found";
+					f = fopen("404.html", "rb");	
+				}
+
+				
+			}
 			if (f)
 			{
+
+				if (fseek(f, 0, SEEK_END) != 0) 
+				{
+					fclose(f);
+					return;
+				}
+				
+				snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: text/html\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n", response.status, ftell(f));
+				rewind(f);
+				//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
+				if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
+				{
+					return;
+				}
 				while ((bytesRead = fread(buffer, 1, sizeof(buffer), f)) > 0)
 				{
 					if (SSL_write(ssl, buffer, bytesRead) <= 0)
@@ -427,8 +492,20 @@ void LoadGetRequest(char* filename, SSL* ssl, char* metadata)
 			}
 			else
 			{
-				//THIS REALLY SHOULDNT BE POSSIBLE BUT IT IS A FAILSAFE
-				printf("ERROR NO FILE FOUND!\n");
+				
+				//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
+				if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
+				{
+					return;
+				}
+				while ((bytesRead = fread(buffer, 1, sizeof(buffer), f)) > 0)
+				{
+					if (SSL_write(ssl, buffer, bytesRead) <= 0)
+					{
+						return;
+					}
+				}
+				fclose(f);
 			}
 			
 		}
@@ -436,54 +513,64 @@ void LoadGetRequest(char* filename, SSL* ssl, char* metadata)
 }
 
 //CHECKS EXTENSION OF FILENAME AND SETS METADATA TO CORRECT VALUES
-MetaData CheckFileExtenstion(char* fileName)
+HTTPResponse CheckFileExtenstion(char* fileName)
 {
-	MetaData finalMetaData;
-	if (strstr(fileName, ".html"))
+	HTTPResponse finalMetaData;
+
+	if (strchr(fileName, '%') != NULL || strchr(fileName, '/') != NULL || strchr(fileName, '\\')  != NULL || strstr(fileName, "..")  != NULL || strlen(fileName) > 100)
 	{
-		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+		printf("BAD URL\n\n");
+		finalMetaData.status = "403 Forbidden";
+		finalMetaData.contentType = "text/html";
+		finalMetaData.isTextFile = -2;
+		return finalMetaData;
+	}
+	else if (strstr(fileName, ".html"))
+	{
+		finalMetaData.status = "200 OK";
+		finalMetaData.contentType = "text/html";
 		finalMetaData.isTextFile = 1;
 		return finalMetaData;
 	}
 	else if (strstr(fileName, ".css"))
 	{
-		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\n\r\n";
+		finalMetaData.status = "200 OK";
+		finalMetaData.contentType = "text/css";
 		finalMetaData.isTextFile = 1;
 		return finalMetaData;
 	}
 	else if (strstr(fileName, ".js"))
 	{
-		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\n\r\n";
+		finalMetaData.status = "200 OK";
+		finalMetaData.contentType = "text/javascript";
 		finalMetaData.isTextFile = 1;
 		return finalMetaData;
 	}
 	else if (strstr(fileName, ".jpg") || strstr(fileName, ".jpeg"))
 	{
-		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\r\n";
+		finalMetaData.status = "200 OK";
+		finalMetaData.contentType = "image/jpeg";
 		finalMetaData.isTextFile = 0;
 		return finalMetaData;
 	}
 	else if (strstr(fileName, ".png"))
 	{
-		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n";
+		finalMetaData.status = "200 OK";
+		finalMetaData.contentType = "image/png";
 		finalMetaData.isTextFile = 0;
-		return finalMetaData;
-	}
-	else if (strchr(fileName, '%') != NULL || strchr(fileName, '/') != NULL || strchr(fileName, '\\')  != NULL || strstr(fileName, "..")  != NULL || strlen(fileName) > 100)
-	{
-		printf("BAD URL\n\n");
-		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
-		finalMetaData.isTextFile = -1;
 		return finalMetaData;
 	}
 	else
 	{
-		finalMetaData.metadata = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+		finalMetaData.status = "404 Not Found";
+		finalMetaData.contentType = "text/html";
 		finalMetaData.isTextFile = -1;
 		return finalMetaData;
 	}
 
-	finalMetaData.metadata = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n";
-		
+	finalMetaData.status = "404 Not Found";
+	finalMetaData.contentType = "text/html";
+	
+	finalMetaData.isTextFile = -1;
 	return finalMetaData;
 }
