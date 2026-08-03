@@ -11,9 +11,6 @@
 
 #define THREAD_COUNT 8
 
-
-
-
 typedef struct 
 {
 	char* data;
@@ -65,6 +62,7 @@ void InitThreadPool();
 //LOADS THE DATA FROM GET REQUEST ON THE WEBSERVER
 void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response);
 
+void *HTTPRedirect(void *arg);
 
 void *WorkerThread(void *arg);
 
@@ -92,7 +90,7 @@ int main()
 		return 1;
 	}
 	
-	//DATA STRUCTURE FOR SOCKET DATA e.g. IP AND PORT
+	//DATA STRUCTURE FOR HTTPS SOCKET DATA e.g. IP AND PORT
 	struct sockaddr_in addr = 
 	{
 		AF_INET,
@@ -146,14 +144,26 @@ int main()
         return 1;
     }
 
-	//MAIN LOOP FOR SENDING AND RECEIVING
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, HTTPRedirect, NULL) != 0)
+	{
+		perror("pthread_create");
+		exit(-1);
+	}
+	pthread_detach(thread);
+
+	//MAIN LOOP FOR ACCEPTING CONNECTIONS AND DISPATCHING THE REQUEST TO A THREAD
 	while (1)
 	{
+		
+		
 		socklen_t clientLen = sizeof(clientAddr);
-		//CHECKS HEADER FOR CONTENT TYPE IN THIS CASE FOR IMAGES
+		
 		printf("awaiting connection....\n");
 		
 		int clientfd = accept(sockfd, (struct sockaddr*)&clientAddr, &clientLen);
+		
+		//PRINTS CLIENT IP ADDRESS
 		printf("Connection from: %s\n\n\n", inet_ntoa(clientAddr.sin_addr));
 		
 		//LOOPS BACK IF NO CLIENT CONNECTION
@@ -163,31 +173,23 @@ int main()
 		}
 		//CREATES AND CHECKS SSL OBJECT
 		ClientConnection *conn = malloc(sizeof(ClientConnection));
+		//IF MALLOC FAILS RESET LOOP
 		if (conn == NULL)
 		{
 			perror("malloc");
 			continue;
 		}
+		
+		//ALLOCATES DATA ABOUT INCOMING CLIENT CONNECTION
 		conn->clientfd = clientfd;
 		conn->ctx = ctx;
 		conn->clientAddr = clientAddr;
 		
 		
-		/*
-		pthread_t thread;
-		if (pthread_create(&thread, NULL, HandleClient, conn) != 0)
-		{
-			perror("pthread_create");
-		
-			close(clientfd);
-			free(conn);
-			continue;
-		}
-		pthread_detach(thread);
-		*/
-		
+		//START OF THREAD JOB ASSIGNMENT
 		pthread_mutex_lock(&pool.mutex);
 		
+		//IF TOO MANY THREADS ARE IN USE DO NOT CREATE MORE JOBS AND RESET LOOP
 		if (pool.count >= 256)
 		{
 			pthread_mutex_unlock(&pool.mutex);
@@ -198,12 +200,16 @@ int main()
 			continue;
 		}
 
+		//SET CONNECTION DATA TO CURRENT THREAD
 		pool.jobs[pool.tail] = conn;
 		
+		//GROWS THE LIST OF CURRENT THREADS IN USE BY 1 AND PREVENTS VALUE FROM BEING GREATED THAN 256
 		pool.tail = (pool.tail + 1) % 256;
 		
+		//INCREMENT ACTIVE THREADS 
 		pool.count++;
 		
+		//UNLOCKS THREAD THAT IS BLOCKED AND WAITING FOR USE
 		pthread_cond_signal(&pool.workAvailable);
 		
 		pthread_mutex_unlock(&pool.mutex);
@@ -328,13 +334,13 @@ void *HandleClient(void *arg)
 			keepAlive = 0;
 		}
 	
+		//STRINGS PARSED FOR SERVER REQUEST
 		char method[16];
 		char filename[256];
 		char version[16];
 	
-	
-		if(sscanf(buffer, "%15s %255s %15s", method, filename, version) == 3
-		&& strcmp(method, "GET") == 0)
+		//PARSES THE REQUEST
+		if(sscanf(buffer, "%15s %255s %15s", method, filename, version) == 3 && strcmp(method, "GET") == 0)
 		{
 			if(filename[0] == '/')
 			{
@@ -344,11 +350,13 @@ void *HandleClient(void *arg)
 			HTTPResponse response = CheckFileExtenstion(filename);
 	
 			LoadGetRequest(filename, ssl, response);
+			
 			if(!keepAlive)
 			{
 				break;
 			}
 		}
+		//IF REQUEST IS NOT A VALID STRING REJECT THE REQUEST AND RETURN 405 
 		else
 		{
 			char* response = "HTTP/1.1 405 Method Not Allowed\r\n Connection: close\r\n\r\n";
@@ -435,11 +443,13 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 				return;
 			}
 			printf("WritingFromCache!\n");
+			//IF CACHED FILE IS SMALLER THAN SET AMOUNT SEND EVERYTHING IN ONE GO
 			if (cachedFiles[i].fileSize <= 16384)
 			{
 				CacheExists = 1;
 				SSL_write(ssl, cachedFiles[i].data, cachedFiles[i].fileSize);
 			}
+			//IF CACHED FILE IS LARGER SEND THE DATA IN CHUNKS
 			else
 			{
 				size_t sent = 0;
@@ -467,7 +477,9 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 		FILE* f = fopen(filename, "rb");
 		char buffer[65536];
 		size_t bytesRead; 
-			
+		
+
+		//IF FILE IS VALID PROCESS REQUEST AND SEND FILE DATA TO USER
 		if (f)
 		{	
 			if (fseek(f, 0, SEEK_END) != 0) 
@@ -495,10 +507,9 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 			}
 			fclose(f);
 		}
+		//IF NOT VALID FILE CHECK AND ASSIGN THE CORRECT ERROR/REDIRECT
 		else
 		{				
-			//FIX LATER: THIS LINE IS SUPPOSED TO REDIRECT TO THE HOME PAGE IF NO TEXT IS ENTERED IN THE URL
-			//PROBLEM IS THE GET REQUEST IS TRUNCATED WITHOUT A FILENAME AND THUS HTTP/1.1 IS GATHERED
 			if (strncmp(filename, "HTTP/1.1", strlen(filename)) == 0)
 			{
 				f = fopen("index.html", "rb");
@@ -548,7 +559,7 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 			else
 			{
 				
-				//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
+				//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING AND CLOSE THE CONNECTIONS
 				if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 				{
 					fclose(f);
@@ -631,7 +642,7 @@ HTTPResponse CheckFileExtenstion(char* fileName)
 	return finalMetaData;
 }
 
-//CREATES THREADS READY TO 
+//CREATES THREADS READY TO EXECUTE THE SERVER REQUEST
 void InitThreadPool()
 {
     pool.head = 0;
@@ -647,6 +658,62 @@ void InitThreadPool()
     }
 }
 
+
+void *HTTPRedirect(void *arg)
+{
+	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	
+	//DATA STRUCTURE FOR HTTP SOCKET DATA e.g. IP AND PORT
+	struct sockaddr_in httpAddr = 
+	{
+		AF_INET,
+		htons(8080),
+		INADDR_ANY
+	};
+	
+	//BINDS PORT AND IP ADDRESS TO SOCKET
+	if (bind(sockfd, (struct sockaddr*)&httpAddr, sizeof(httpAddr)) < 0)
+	{
+		perror("ERROR: unable to bind socket!");
+		exit(-1);
+	}
+	
+	//CREATES LISTENER ON SOCKET
+	if (listen(sockfd, 10))
+	{
+		perror("ERROR: unable to listen on this socket!");
+		exit(-1);
+	}
+	
+	//CLIENT DATA
+	struct sockaddr_in clientAddr;
+	socklen_t clientLen = sizeof(clientAddr);
+	
+	while (1)
+    {
+		char buffer[4096];
+        int clientfd = accept(sockfd, (struct sockaddr *)&clientAddr, &clientLen);
+		if (clientfd < 0)
+		{
+			perror("accept");
+			continue;
+		}
+		recv(clientfd, buffer, sizeof(buffer), 0);
+		char response[] =
+        "HTTP/1.1 301 Moved Permanently\r\n"
+        "Location: https://localhost:54000\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+
+		send(clientfd, response, strlen(response), 0);
+		close(clientfd);
+    }
+	
+	
+	
+}
+
+//RUNS THE JOB FOR A DISPATCHED THREAD
 void *WorkerThread(void *arg)
 {
     while (1)
@@ -664,7 +731,8 @@ void *WorkerThread(void *arg)
         pool.count--;
 
         pthread_mutex_unlock(&pool.mutex);
-
+		
+		//PROCESS SERVER REQUEST
         HandleClient(conn);
     }
 
