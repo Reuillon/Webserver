@@ -9,6 +9,11 @@
 #include <string.h>
 #include <pthread.h>
 
+#define THREAD_COUNT 8
+
+
+
+
 typedef struct 
 {
 	char* data;
@@ -35,12 +40,33 @@ typedef struct
     struct sockaddr_in clientAddr;
 } ClientConnection;
 
+typedef struct
+{
+    pthread_t threads[THREAD_COUNT];
+
+    ClientConnection *jobs[256];
+
+    int head;
+    int tail;
+    int count;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t workAvailable;
+
+} ThreadPool;
+
 CachedFile* LoadCacheList();
 
 int cachedFileSize = 0;
 
+//INITIALIZES THREADS TO BE DISPATCHED FOR REQUESTS 
+void InitThreadPool();
+
 //LOADS THE DATA FROM GET REQUEST ON THE WEBSERVER
 void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response);
+
+
+void *WorkerThread(void *arg);
 
 CachedFile InitCachedFile(char* fileName, int isTextFile);
 
@@ -50,8 +76,12 @@ void *HandleClient(void *arg);
 
 CachedFile* cachedFiles;
 
+ThreadPool pool;
+
 int main() 
 {
+
+	InitThreadPool();
 	cachedFiles = LoadCacheList();
 	
 	//CREATES SOCKET
@@ -142,6 +172,8 @@ int main()
 		conn->ctx = ctx;
 		conn->clientAddr = clientAddr;
 		
+		
+		/*
 		pthread_t thread;
 		if (pthread_create(&thread, NULL, HandleClient, conn) != 0)
 		{
@@ -152,7 +184,29 @@ int main()
 			continue;
 		}
 		pthread_detach(thread);
+		*/
 		
+		pthread_mutex_lock(&pool.mutex);
+		
+		if (pool.count >= 256)
+		{
+			pthread_mutex_unlock(&pool.mutex);
+		
+			close(clientfd);
+			free(conn);
+		
+			continue;
+		}
+
+		pool.jobs[pool.tail] = conn;
+		
+		pool.tail = (pool.tail + 1) % 256;
+		
+		pool.count++;
+		
+		pthread_cond_signal(&pool.workAvailable);
+		
+		pthread_mutex_unlock(&pool.mutex);
 		
 	}
 
@@ -253,7 +307,7 @@ void *HandleClient(void *arg)
     }
 
 
-char buffer[65536];
+	char buffer[65536];
 
 	while(1)
 	{
@@ -307,9 +361,7 @@ char buffer[65536];
     SSL_shutdown(ssl);
     SSL_free(ssl);
     close(clientfd);
-
-    free(conn);
-
+	free(conn);
     return NULL;
 }
 
@@ -376,8 +428,7 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 	{
 		if (strncmp(cachedFiles[i].fileName, filename, strlen(filename)) == 0)
 		{
-			snprintf(finalResponseString, sizeof(finalResponseString),
-			"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
+			snprintf(finalResponseString, sizeof(finalResponseString),"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=1800\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
 			//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
 			if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 			{
@@ -425,18 +476,20 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 				return;
 			}
 			 
-			snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, ftell(f));
+			snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=1800\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, ftell(f));
 			rewind(f);
 			
 			//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
 			if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 			{
+				fclose(f);
 				return;
 			}	
 			while ((bytesRead = fread(buffer, 1, sizeof(buffer), f)) > 0)
 			{
 				if (SSL_write(ssl, buffer, bytesRead) <= 0)
 				{
+					fclose(f);
 					return;
 				}
 			}
@@ -474,17 +527,19 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 					return;
 				}
 				
-				snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: text/html\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n\r\n", response.status, ftell(f));
+				snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: text/html\r\nContent-Length: %zu\r\nCache-Control: public, max-age=1800\r\nConnection: keep-alive\r\n\r\n", response.status, ftell(f));
 				rewind(f);
 				//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
 				if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 				{
+					fclose(f);
 					return;
 				}
 				while ((bytesRead = fread(buffer, 1, sizeof(buffer), f)) > 0)
 				{
 					if (SSL_write(ssl, buffer, bytesRead) <= 0)
 					{
+						fclose(f);
 						return;
 					}
 				}
@@ -496,12 +551,14 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 				//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
 				if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 				{
+					fclose(f);
 					return;
 				}
 				while ((bytesRead = fread(buffer, 1, sizeof(buffer), f)) > 0)
 				{
 					if (SSL_write(ssl, buffer, bytesRead) <= 0)
 					{
+						fclose(f);
 						return;
 					}
 				}
@@ -519,7 +576,6 @@ HTTPResponse CheckFileExtenstion(char* fileName)
 
 	if (strchr(fileName, '%') != NULL || strchr(fileName, '/') != NULL || strchr(fileName, '\\')  != NULL || strstr(fileName, "..")  != NULL || strlen(fileName) > 100)
 	{
-		printf("BAD URL\n\n");
 		finalMetaData.status = "403 Forbidden";
 		finalMetaData.contentType = "text/html";
 		finalMetaData.isTextFile = -2;
@@ -573,4 +629,44 @@ HTTPResponse CheckFileExtenstion(char* fileName)
 	
 	finalMetaData.isTextFile = -1;
 	return finalMetaData;
+}
+
+//CREATES THREADS READY TO 
+void InitThreadPool()
+{
+    pool.head = 0;
+    pool.tail = 0;
+    pool.count = 0;
+
+    pthread_mutex_init(&pool.mutex, NULL);
+    pthread_cond_init(&pool.workAvailable, NULL);
+
+    for (int i = 0; i < THREAD_COUNT; i++)
+    {
+        pthread_create(&pool.threads[i], NULL, WorkerThread, NULL);
+    }
+}
+
+void *WorkerThread(void *arg)
+{
+    while (1)
+    {
+        pthread_mutex_lock(&pool.mutex);
+
+        while (pool.count == 0)
+        {
+            pthread_cond_wait(&pool.workAvailable, &pool.mutex);
+        }
+
+        ClientConnection *conn = pool.jobs[pool.head];
+
+        pool.head = (pool.head + 1) % 256;
+        pool.count--;
+
+        pthread_mutex_unlock(&pool.mutex);
+
+        HandleClient(conn);
+    }
+
+    return NULL;
 }
