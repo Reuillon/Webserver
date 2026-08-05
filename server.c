@@ -56,6 +56,11 @@ CachedFile* LoadCacheList();
 
 int cachedFileSize = 0;
 
+double RATE_LIMIT_RESET = 5.0f;
+
+unsigned int RATE_LIMIT = 1000;
+unsigned int serverConnections = 0;
+
 //INITIALIZES THREADS TO BE DISPATCHED FOR REQUESTS 
 void InitThreadPool();
 
@@ -65,6 +70,8 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response);
 void *HTTPRedirect(void *arg);
 
 void *WorkerThread(void *arg);
+
+void *RequestTimer(void *arg);
 
 CachedFile InitCachedFile(char* fileName, int isTextFile);
 
@@ -152,17 +159,25 @@ int main()
 	}
 	pthread_detach(thread);
 
+	pthread_t timerThread;
+	if (pthread_create(&timerThread, NULL, RequestTimer, NULL) != 0)
+	{
+		perror("pthread_create");
+		exit(-1);
+	}
+	pthread_detach(timerThread);
+
 	//MAIN LOOP FOR ACCEPTING CONNECTIONS AND DISPATCHING THE REQUEST TO A THREAD
 	while (1)
 	{
 		
-		
+
 		socklen_t clientLen = sizeof(clientAddr);
 		
 		printf("awaiting connection....\n");
 		
 		int clientfd = accept(sockfd, (struct sockaddr*)&clientAddr, &clientLen);
-		
+
 		//PRINTS CLIENT IP ADDRESS
 		printf("Connection from: %s\n\n\n", inet_ntoa(clientAddr.sin_addr));
 		
@@ -333,7 +348,7 @@ void *HandleClient(void *arg)
 		{
 			keepAlive = 0;
 		}
-	
+		serverConnections += 1;
 		//STRINGS PARSED FOR SERVER REQUEST
 		char method[16];
 		char filename[256];
@@ -346,10 +361,18 @@ void *HandleClient(void *arg)
 			{
 				memmove(filename, filename + 1, strlen(filename));
 			}
-	
-			HTTPResponse response = CheckFileExtenstion(filename);
-	
-			LoadGetRequest(filename, ssl, response);
+			
+			if (serverConnections < RATE_LIMIT)
+			{
+				HTTPResponse response = CheckFileExtenstion(filename);
+				LoadGetRequest(filename, ssl, response);
+			}
+			else
+			{
+				printf("TOO MANY REQUESTS!\n");
+				HTTPResponse response = CheckFileExtenstion("429.html");
+				LoadGetRequest("429.html", ssl, response);
+			}
 			
 			if(!keepAlive)
 			{
@@ -428,25 +451,33 @@ CachedFile InitCachedFile(char* fileName, int isTextFile)
 void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 {
 	
-	char finalResponseString[256];
-	
+	char finalResponseString[256];	
 	int CacheExists = 0;	
+	
 	//CHECKS IF FILE REQUEST EXISTS ON DISK
 	for(int i = 0; i < cachedFileSize; i++)
 	{
+
 		if (strncmp(cachedFiles[i].fileName, filename, strlen(filename)) == 0)
 		{
-			snprintf(finalResponseString, sizeof(finalResponseString),"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=1800\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
+			if (serverConnections > RATE_LIMIT)
+			{
+				snprintf(finalResponseString, sizeof(finalResponseString),"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=0\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
+			}
+			else
+			{
+				snprintf(finalResponseString, sizeof(finalResponseString),"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=300\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
+			}
 			//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
 			if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 			{
 				return;
 			}
+			CacheExists = 1;
 			printf("WritingFromCache!\n");
 			//IF CACHED FILE IS SMALLER THAN SET AMOUNT SEND EVERYTHING IN ONE GO
 			if (cachedFiles[i].fileSize <= 16384)
 			{
-				CacheExists = 1;
 				SSL_write(ssl, cachedFiles[i].data, cachedFiles[i].fileSize);
 			}
 			//IF CACHED FILE IS LARGER SEND THE DATA IN CHUNKS
@@ -477,17 +508,19 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 		FILE* f = fopen(filename, "rb");
 		char buffer[65536];
 		size_t bytesRead; 
-		
 
 		//IF FILE IS VALID PROCESS REQUEST AND SEND FILE DATA TO USER
 		if (f)
 		{	
+	
 			if (fseek(f, 0, SEEK_END) != 0) 
 			{
 				fclose(f);
 				return;
 			}
-			 
+			
+
+			
 			snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=1800\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, ftell(f));
 			rewind(f);
 			
@@ -509,7 +542,8 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 		}
 		//IF NOT VALID FILE CHECK AND ASSIGN THE CORRECT ERROR/REDIRECT
 		else
-		{				
+		{	
+			
 			if (strncmp(filename, "HTTP/1.1", strlen(filename)) == 0)
 			{
 				f = fopen("index.html", "rb");
@@ -558,7 +592,6 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 			}
 			else
 			{
-				
 				//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING AND CLOSE THE CONNECTIONS
 				if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 				{
@@ -693,6 +726,7 @@ void *HTTPRedirect(void *arg)
     {
 		char buffer[4096];
         int clientfd = accept(sockfd, (struct sockaddr *)&clientAddr, &clientLen);
+		serverConnections += 1;
 		if (clientfd < 0)
 		{
 			perror("accept");
@@ -710,6 +744,26 @@ void *HTTPRedirect(void *arg)
     }
 	
 	
+	
+}
+
+void *RequestTimer(void *arg)
+{
+	double prevTime, currentTime;
+	double thisTimer = 0.0f;
+	double offset = 0.0f;
+	
+	while(1)
+	{
+		thisTimer = (((double)clock()) / CLOCKS_PER_SEC) - offset;	
+		printf("TIME ELAPSED: %lf\n",thisTimer);
+		if (thisTimer > RATE_LIMIT_RESET)
+		{
+			serverConnections = 0;
+			offset += thisTimer;
+			thisTimer = 0.0f;
+		}
+	}
 	
 }
 
