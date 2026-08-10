@@ -56,7 +56,9 @@ CachedFile* LoadCacheList();
 
 int cachedFileSize = 0;
 
-double RATE_LIMIT_RESET = 5.0f;
+int PAGE_CACHE_TIMER = 300;
+
+double RATE_LIMIT_RESET = 60.0f;
 
 unsigned int RATE_LIMIT = 1000;
 unsigned int serverConnections = 0;
@@ -460,14 +462,8 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 
 		if (strncmp(cachedFiles[i].fileName, filename, strlen(filename)) == 0)
 		{
-			if (serverConnections > RATE_LIMIT)
-			{
-				snprintf(finalResponseString, sizeof(finalResponseString),"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=0\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
-			}
-			else
-			{
-				snprintf(finalResponseString, sizeof(finalResponseString),"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=300\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize);
-			}
+			snprintf(finalResponseString, sizeof(finalResponseString),"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=%d\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, cachedFiles[i].fileSize, PAGE_CACHE_TIMER);
+	
 			//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
 			if (SSL_write(ssl, finalResponseString, strlen(finalResponseString)) <= 0)
 			{
@@ -521,7 +517,7 @@ void LoadGetRequest(char* filename, SSL* ssl, HTTPResponse response)
 			
 
 			
-			snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=1800\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, ftell(f));
+			snprintf(finalResponseString, sizeof(finalResponseString), "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: public, max-age=%d\r\nConnection: keep-alive\r\n\r\n", response.status, response.contentType, ftell(f), PAGE_CACHE_TIMER);
 			rewind(f);
 			
 			//IF THERE IS NO ESTABLISHED SSL CONNECTION DO NOTHING
@@ -756,13 +752,21 @@ void *RequestTimer(void *arg)
 	while(1)
 	{
 		thisTimer = (((double)clock()) / CLOCKS_PER_SEC) - offset;	
-		printf("TIME ELAPSED: %lf\n",thisTimer);
 		if (thisTimer > RATE_LIMIT_RESET)
 		{
 			serverConnections = 0;
 			offset += thisTimer;
 			thisTimer = 0.0f;
 		}
+		if (serverConnections < RATE_LIMIT)
+		{
+			PAGE_CACHE_TIMER = 300;
+		}
+		else
+		{
+			PAGE_CACHE_TIMER = 0;
+		}
+		
 	}
 	
 }
